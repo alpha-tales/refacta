@@ -1,0 +1,28 @@
+{
+  "project": {
+    "name": "alphatales-refactor-agent",
+    "version": "2.0.0"
+  },
+  "agents": {
+    "setting_sources": ["project"],
+    "permission_mode": "acceptEdits"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(powershell:*)",
+      "Bash(npm:*)",
+      "Bash(pytest:*)",
+      "Bash(ruff:*)",
+      "Bash(python:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)"
+    ]
+  },
+  "token_limits": {
+    "max_file_read_lines": 500,
+    "max_output_lines": 100,
+    "summarize_large_outputs": true
+  }
+}
