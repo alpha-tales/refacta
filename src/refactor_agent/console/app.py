@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 from typing import Optional, List, Iterable
 
+from enum import Enum
 from rich.text import Text
 
 from textual import on, work
@@ -28,6 +29,13 @@ from textual_autocomplete import AutoComplete, DropdownItem, TargetState
 
 from ..sdk.client import AgentClient
 from .diff_viewer import EditOperation, format_edit_for_chat, format_edit_full, format_edits_summary
+
+
+class ScopeType(Enum):
+    """Scope type for refactoring target."""
+    ALL_PROJECT = "all"      # Work on entire project, no @ autocomplete
+    FOLDER = "folder"        # Select folders only
+    FILES = "files"          # Select files only
 
 
 # AlphaTales Logo ASCII Art
@@ -44,31 +52,71 @@ ALPHATALES_LOGO = """
 
 class FileCandidate:
     """File candidate with searchable path."""
-    def __init__(self, rel_path: str):
+    def __init__(self, rel_path: str, is_folder: bool = False):
         self.rel_path = rel_path
-        self.display = f"@{rel_path}"
+        self.is_folder = is_folder
+        # Add trailing slash for folders to make it clear
+        display_path = f"{rel_path}/" if is_folder else rel_path
+        self.display = f"@{display_path}"
         self.dropdown_item = DropdownItem(main=self.display)
 
 
-def get_file_candidates(project_path: Path) -> List[FileCandidate]:
-    """Get all files in project as autocomplete candidates."""
-    files = []
+def get_file_candidates(
+    project_path: Path,
+    scope: ScopeType = ScopeType.FILES
+) -> List[FileCandidate]:
+    """Get files or folders in project as autocomplete candidates.
+
+    Args:
+        project_path: Root project path
+        scope: What to return - FILES (files only), FOLDER (folders only), ALL_PROJECT (empty)
+
+    Returns:
+        List of FileCandidate objects
+    """
+    # ALL_PROJECT scope means no autocomplete needed
+    if scope == ScopeType.ALL_PROJECT:
+        return []
+
+    candidates = []
+    ignored_dirs = {'node_modules', '__pycache__', 'venv', '.git', 'dist', 'build', '.refactor', '.claude'}
+
     try:
         for root, dirs, filenames in os.walk(project_path):
             # Skip hidden and common ignored directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', 'venv', '.git', 'dist', 'build']]
-            for f in filenames:
-                if f.startswith('.'):
-                    continue
-                rel_path = os.path.relpath(os.path.join(root, f), project_path)
-                files.append(FileCandidate(rel_path))
-                if len(files) >= 100:
-                    break
-            if len(files) >= 100:
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ignored_dirs]
+
+            rel_root = os.path.relpath(root, project_path)
+
+            if scope == ScopeType.FOLDER:
+                # Add folders only
+                for d in dirs:
+                    if rel_root == '.':
+                        rel_path = d
+                    else:
+                        rel_path = os.path.join(rel_root, d)
+                    candidates.append(FileCandidate(rel_path, is_folder=True))
+                    if len(candidates) >= 50:
+                        break
+            else:
+                # Add files only (ScopeType.FILES)
+                for f in filenames:
+                    if f.startswith('.'):
+                        continue
+                    if rel_root == '.':
+                        rel_path = f
+                    else:
+                        rel_path = os.path.join(rel_root, f)
+                    candidates.append(FileCandidate(rel_path, is_folder=False))
+                    if len(candidates) >= 100:
+                        break
+
+            if len(candidates) >= (50 if scope == ScopeType.FOLDER else 100):
                 break
     except Exception:
         pass
-    return files
+
+    return candidates
 
 
 class MessageBubble(Static):
@@ -398,15 +446,120 @@ class WelcomeScreen(Screen):
                 yield Button("Refactor", id="btn-refactor", variant="primary")
                 yield Button("Migrate", id="btn-migrate")
 
-    @on(Button.Pressed, "#btn-refactor")
-    def on_refactor(self) -> None:
-        self.app.operation = "refactor"
-        self.app.switch_screen(MainScreen())
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses on welcome screen."""
+        button_id = event.button.id
 
-    @on(Button.Pressed, "#btn-migrate")
-    def on_migrate(self) -> None:
-        self.app.operation = "migrate"
-        self.app.switch_screen(MainScreen())
+        if button_id == "btn-refactor":
+            self.app.operation = "refactor"
+            self.app.push_screen("scope")
+        elif button_id == "btn-migrate":
+            self.app.operation = "migrate"
+            self.app.push_screen("scope")
+
+
+class ScopeSelectionScreen(Screen):
+    """Scope selection screen - choose All Project, Folder, or Files."""
+
+    DEFAULT_CSS = """
+    ScopeSelectionScreen {
+        align: center middle;
+        background: #1a1a2e;
+    }
+
+    ScopeSelectionScreen > Vertical {
+        width: 60;
+        height: auto;
+        padding: 2 4;
+        background: #16213e;
+        border: round #6366f1;
+    }
+
+    ScopeSelectionScreen .header-box {
+        width: 100%;
+        height: auto;
+        background: #6366f1;
+        color: #ffffff;
+        padding: 1 2;
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 2;
+    }
+
+    ScopeSelectionScreen .subtitle {
+        text-align: center;
+        color: #94a3b8;
+        margin-bottom: 2;
+    }
+
+    ScopeSelectionScreen .scope-btn {
+        width: 100%;
+        margin: 1 0;
+        height: 3;
+        background: #252545;
+        color: #e2e8f0;
+        border: solid #6366f1;
+    }
+
+    ScopeSelectionScreen .scope-btn:hover {
+        background: #6366f1;
+        color: #ffffff;
+    }
+
+    ScopeSelectionScreen .scope-btn:focus {
+        background: #4f46e5;
+        color: #ffffff;
+    }
+
+    ScopeSelectionScreen .btn-desc {
+        color: #64748b;
+        text-align: center;
+        margin-bottom: 1;
+    }
+
+    ScopeSelectionScreen .back-btn {
+        margin-top: 2;
+        background: transparent;
+        color: #64748b;
+        border: none;
+    }
+
+    ScopeSelectionScreen .back-btn:hover {
+        color: #6366f1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static("Select Scope", classes="header-box")
+            yield Static("What do you want to work on?", classes="subtitle")
+
+            yield Button("All Project", id="btn-scope-all", classes="scope-btn")
+            yield Static("Work on entire codebase", classes="btn-desc")
+
+            yield Button("Folder", id="btn-scope-folder", classes="scope-btn")
+            yield Static("Select specific folders", classes="btn-desc")
+
+            yield Button("Files", id="btn-scope-files", classes="scope-btn")
+            yield Static("Select individual files", classes="btn-desc")
+
+            yield Button("← Back", id="btn-scope-back", classes="back-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses on scope selection screen."""
+        button_id = event.button.id
+
+        if button_id == "btn-scope-all":
+            self.app.scope = ScopeType.ALL_PROJECT
+            self.app.push_screen("main")
+        elif button_id == "btn-scope-folder":
+            self.app.scope = ScopeType.FOLDER
+            self.app.push_screen("main")
+        elif button_id == "btn-scope-files":
+            self.app.scope = ScopeType.FILES
+            self.app.push_screen("main")
+        elif button_id == "btn-scope-back":
+            self.app.pop_screen()
 
 
 class MainScreen(Screen):
@@ -425,6 +578,21 @@ class MainScreen(Screen):
 
     MainScreen > Vertical {
         height: 100%;
+    }
+
+    /* Back button - top left corner */
+    MainScreen .back-button {
+        dock: top;
+        width: auto;
+        height: 3;
+        margin: 1 0 0 2;
+        background: transparent;
+        color: #64748b;
+        border: none;
+    }
+
+    MainScreen .back-button:hover {
+        color: #6366f1;
     }
 
     /* AutoComplete dropdown styling */
@@ -583,6 +751,9 @@ class MainScreen(Screen):
         self._file_candidates: List[FileCandidate] = []
 
     def compose(self) -> ComposeResult:
+        # Back button at top left
+        yield Button("← Back", id="btn-back", classes="back-button")
+
         with Vertical():
             # Centered header with logo - hidden when messages exist
             with Container(classes="header-area", id="header"):
@@ -602,7 +773,7 @@ class MainScreen(Screen):
                             chat_input = Input(placeholder="Type a message...", id="chat-input")
                             yield chat_input
                         with Horizontal(classes="input-footer"):
-                            yield Static("@ for files • /help for commands", classes="input-hint")
+                            yield Static("", classes="input-hint", id="input-hint")
                             yield Button("↑", id="send-btn", classes="send-button")
 
         # AutoComplete for file selection (attached to input)
@@ -613,7 +784,12 @@ class MainScreen(Screen):
         )
 
     def _get_candidates(self, state: TargetState) -> Iterable[DropdownItem]:
-        """Get file candidates when @ is typed."""
+        """Get file/folder candidates when @ is typed (based on scope)."""
+        # Check scope - if ALL_PROJECT, no autocomplete
+        scope = getattr(self.app, 'scope', ScopeType.FILES)
+        if scope == ScopeType.ALL_PROJECT:
+            return []
+
         value = state.text
         cursor = state.cursor_position
 
@@ -630,10 +806,10 @@ class MainScreen(Screen):
         if " " in query:
             return []
 
-        # Load file candidates if not loaded
+        # Load candidates based on scope (lazy load)
         if not self._file_candidates:
             project_path = getattr(self.app, "project_path", Path.cwd())
-            self._file_candidates = get_file_candidates(project_path)
+            self._file_candidates = get_file_candidates(project_path, scope)
 
         # Filter candidates based on query and return DropdownItems
         if query:
@@ -644,7 +820,40 @@ class MainScreen(Screen):
         return [item.dropdown_item for item in self._file_candidates]
 
     def on_mount(self) -> None:
+        # Reset file candidates cache (in case scope changed)
+        self._file_candidates = []
         self.query_one("#chat-input", Input).focus()
+        self._update_input_hint()
+        self._update_placeholder()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses on main screen."""
+        if event.button.id == "btn-back":
+            self.app.pop_screen()
+
+    def _update_input_hint(self) -> None:
+        """Update the input hint based on current scope."""
+        hint_widget = self.query_one("#input-hint", Static)
+        scope = getattr(self.app, 'scope', ScopeType.FILES)
+
+        if scope == ScopeType.ALL_PROJECT:
+            hint_widget.update("Working on entire project • /help for commands")
+        elif scope == ScopeType.FOLDER:
+            hint_widget.update("@ for folders • /help for commands")
+        else:
+            hint_widget.update("@ for files • /help for commands")
+
+    def _update_placeholder(self) -> None:
+        """Update input placeholder based on scope."""
+        input_widget = self.query_one("#chat-input", Input)
+        scope = getattr(self.app, 'scope', ScopeType.FILES)
+
+        if scope == ScopeType.ALL_PROJECT:
+            input_widget.placeholder = "Describe what to refactor in the project..."
+        elif scope == ScopeType.FOLDER:
+            input_widget.placeholder = "Type @ to select folders, then describe changes..."
+        else:
+            input_widget.placeholder = "Type @ to select files, then describe changes..."
 
     @on(Input.Submitted, "#chat-input")
     def on_chat_submitted(self, event: Input.Submitted) -> None:
@@ -714,7 +923,7 @@ class MainScreen(Screen):
             messages.remove_children()
 
         elif cmd == "/new":
-            self.app.push_screen(WelcomeScreen())
+            self.app.push_screen("welcome")
 
         elif cmd == "/quit":
             self.app.exit()
@@ -970,6 +1179,7 @@ class MainScreen(Screen):
             use_full_preset: If True, add instructions for comprehensive refactoring
         """
         operation = getattr(self.app, 'operation', 'refactor')
+        scope = getattr(self.app, 'scope', ScopeType.ALL_PROJECT)
         project_path = self.app.project_path
 
         parts = []
@@ -980,6 +1190,15 @@ class MainScreen(Screen):
             parts.append("You are helping migrate code between frameworks.")
 
         parts.append(f"Project directory: {project_path}")
+
+        # Add scope context
+        if scope == ScopeType.ALL_PROJECT:
+            parts.append("Scope: ENTIRE PROJECT - Work on all files in the project.")
+        elif scope == ScopeType.FOLDER:
+            parts.append("Scope: SPECIFIC FOLDERS - User will specify folders using @folder syntax.")
+        else:
+            parts.append("Scope: SPECIFIC FILES - User will specify files using @file syntax.")
+
         parts.append(f"\nUser request: {user_message}")
 
         if use_full_preset:
@@ -1018,7 +1237,7 @@ Instructions:
         self.app.exit()
 
     def action_new_session(self) -> None:
-        self.app.push_screen(WelcomeScreen())
+        self.app.push_screen("welcome")
 
     def action_focus_input(self) -> None:
         self.query_one("#chat-input", Input).focus()
@@ -1065,6 +1284,13 @@ class RefactorAgentApp(App):
         Binding("ctrl+n", "new_session", "New Session"),
     ]
 
+    # Register screens with names
+    SCREENS = {
+        "welcome": WelcomeScreen,
+        "scope": ScopeSelectionScreen,
+        "main": MainScreen,
+    }
+
     def __init__(
         self,
         project_path: Optional[Path] = None,
@@ -1075,16 +1301,17 @@ class RefactorAgentApp(App):
         self.project_path = project_path or Path.cwd()
         self.model = model
         self.operation: str = "refactor"
+        self.scope: ScopeType = ScopeType.ALL_PROJECT  # Default scope
         self._agent_client: Optional[AgentClient] = None
 
     def on_mount(self) -> None:
-        self.push_screen(WelcomeScreen())
+        self.push_screen("welcome")
 
     def action_quit(self) -> None:
         self.exit()
 
     def action_new_session(self) -> None:
-        self.push_screen(WelcomeScreen())
+        self.push_screen("welcome")
 
 
 def run_app(project_path: Optional[Path] = None, model: str = "claude-haiku-4-5-20251001") -> None:
