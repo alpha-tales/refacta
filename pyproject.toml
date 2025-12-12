@@ -35,7 +35,7 @@ dependencies = [
     "rich>=13.7.0",
     "prompt-toolkit>=3.0.43",
     "textual>=0.89.0",
-    "textual-autocomplete>=4.0.0",
+    "textual-autocomplete>=4.0.6",
 
     # Configuration
     "python-dotenv>=1.0.0",

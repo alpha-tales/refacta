@@ -1,23 +1,24 @@
 # Core Dependencies
-claude-agent-sdk>=0.1.14        # Claude Agent SDK (main framework)
+claude-agent-sdk>=0.1.15        # Claude Agent SDK (main framework)
 anthropic>=0.75.0               # Official Anthropic API (required by SDK)
 
 # CLI & Console UI
-typer>=0.12.0                   # Modern CLI framework
-rich>=13.7.0                    # Beautiful console formatting and UI
-prompt-toolkit>=3.0.43          # Interactive command line with autocomplete
-textual>=0.89.0                 # Modern TUI framework for Claude Code-style UI
+typer>=0.20.0                   # Modern CLI framework
+rich>=14.2.0                    # Beautiful console formatting and UI
+prompt-toolkit>=3.0.52          # Interactive command line with autocomplete
+textual>=6.8.0                 # Modern TUI framework for Claude Code-style UI
+textual-autocomplete>=4.0.6    # Autocomplete dropdown for Textual inputs
 
 # Configuration & Environment
-python-dotenv>=1.0.0            # Environment variable management
-pydantic>=2.0.0                 # Data validation
-pydantic-settings>=2.0.0        # Settings management
+python-dotenv>=1.2.1            # Environment variable management
+pydantic>=2.12.5                # Data validation
+pydantic-settings>=2.12.0        # Settings management
 
 # Logging
-loguru>=0.7.2                   # Better logging
+loguru>=0.7.3                   # Better logging
 
 # Optional: Code Analysis
-pygments>=2.17.0                # Syntax highlighting
+pygments>=2.19.2                # Syntax highlighting
 
 # Development Dependencies (install with pip install -e ".[dev]")
 # pytest>=8.0.0
