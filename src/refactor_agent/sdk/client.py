@@ -12,6 +12,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import yaml
@@ -21,7 +22,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ToolUseBlock
 
-from ..console.diff_viewer import EditOperation
+from ..models import EditOperation
 from .report_tracker import ReportTracker, get_tracker
 
 
@@ -302,9 +303,11 @@ class AgentClient:
     """
 
     project_path: Path
-    model: str = "claude-haiku-4-5-20251001"
-    max_turns: int = 3  # Default: 3 turns for simple edits
-    max_turns_full: int = 10  # Full mode: 10 turns for comprehensive refactoring
+    refacta_path: Optional[Path] = None  # Path to refacta source (for agents/skills)
+    model: str = "claude-sonnet-4-5-20250929"
+    max_turns: int = 5  # Default: 5 turns for simple edits
+    max_turns_full: int = 15  # Full mode: 15 turns for comprehensive refactoring
+    max_turns_smart: int = 20  # Smart routing: 20 turns (need enough for Glob + multiple Read + Edit)
     _session_manager: SessionManager = field(default_factory=SessionManager)
     _cost_tracker: CostTracker = field(default_factory=CostTracker)
     _on_message: Optional[Callable[[Any], None]] = None
@@ -318,8 +321,14 @@ class AgentClient:
             raise ValueError("ANTHROPIC_API_KEY environment variable not set")
         self.project_path = Path(self.project_path).resolve()
 
-        # Load all agents from .claude/agents/
-        self._agents = load_all_agents(self.project_path)
+        # Set refacta_path - default to P:\Source\refacta for agents/skills
+        if self.refacta_path is None:
+            self.refacta_path = Path(r"P:\Source\refacta")
+        else:
+            self.refacta_path = Path(self.refacta_path).resolve()
+
+        # Load agents from REFACTA source (not target project)
+        self._agents = load_all_agents(self.refacta_path)
 
         # Initialize report tracker
         self._report_tracker = get_tracker(self.project_path)
@@ -490,25 +499,21 @@ Be direct and concise. Execute actions, don't just plan them."""
     ) -> ClaudeAgentOptions:
         """Build SDK options with native agent auto-selection.
 
-        This passes ALL agents to the SDK via the `agents` parameter.
-        Claude automatically selects the best agent based on description matching.
-        This is FREE - no extra API call needed for agent selection!
+        The SDK automatically loads agents from .claude/agents/ when
+        setting_sources: ["project"] is used. Claude then selects the best
+        agent based on description matching. This is FREE - no extra API call!
 
         Args:
             resume_session: Session ID to resume
 
         Returns:
-            ClaudeAgentOptions with agents parameter for auto-selection
+            ClaudeAgentOptions configured for auto-selection
         """
-        # Convert our agents to SDK format
-        sdk_agents = build_agents_for_sdk(self._agents)
-
         options_dict = {
             "model": self.model,
             "max_turns": self.max_turns_full,
             "cwd": str(self.project_path),
-            "setting_sources": ["project"],  # Load skills and CLAUDE.md
-            "agents": sdk_agents,  # Native SDK agent selection!
+            "setting_sources": ["project"],  # Loads agents, skills, and CLAUDE.md
         }
 
         # Session management
@@ -516,6 +521,379 @@ Be direct and concise. Execute actions, don't just plan them."""
             options_dict["resume"] = resume_session
 
         return ClaudeAgentOptions(**options_dict)
+
+    # =========================================================================
+    # 2-STEP SMART ROUTING (Token Efficient)
+    # Step 1: Send descriptions only (~400 tokens) → Claude picks agents
+    # Step 2: Load selected agent + skills only (~2-3k tokens)
+    # Total: ~3k tokens vs ~10k for loading all agents
+    # =========================================================================
+
+    def _build_routing_prompt(self) -> str:
+        """Build a compact routing prompt with agent descriptions only.
+
+        This is used for Step 1 of smart routing - just ~400 tokens.
+        Returns a formatted list of agent names and descriptions.
+        """
+        descriptions = []
+        for name, agent_def in self._agents.items():
+            # Use only the description, not the full prompt
+            desc = agent_def.description or f"Agent for {name} tasks"
+            descriptions.append(f"- {name}: {desc}")
+
+        return "\n".join(descriptions)
+
+    async def _route_to_agents(self, user_prompt: str) -> List[str]:
+        """Route user request to agent(s) using DESCRIPTION-BASED routing.
+
+        Uses 1 API call (~500 tokens) to let Claude pick the best agent
+        based on agent descriptions.
+
+        Args:
+            user_prompt: The user's request
+
+        Returns:
+            List of agent names to use (e.g., ["python-refactorer"])
+        """
+        agent_list = self._build_routing_prompt()
+
+        routing_system_prompt = f"""You are an agent router. Select the best agent for this task.
+
+Available agents:
+{agent_list}
+
+Return ONLY a JSON array with 1 agent name. Example: ["python-refactorer"]"""
+
+        options = ClaudeAgentOptions(
+            model="claude-sonnet-4-5-20250929",
+            max_turns=1,
+            cwd=str(self.project_path),
+            system_prompt=routing_system_prompt,
+        )
+
+        result_text = ""
+        try:
+            async for message in query(prompt=user_prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    if hasattr(message, 'content'):
+                        for block in message.content:
+                            if hasattr(block, 'text'):
+                                result_text += block.text
+        except Exception:
+            pass
+
+        # Parse JSON response
+        try:
+            text = result_text.strip()
+            if "[" in text:
+                start = text.find("[")
+                end = text.rfind("]") + 1
+                text = text[start:end]
+            agents = json.loads(text)
+            if isinstance(agents, list):
+                valid = [a for a in agents if a in self._agents]
+                if valid:
+                    return valid
+        except:
+            pass
+
+        # Fallback to keyword matching
+        user_lower = user_prompt.lower()
+        if any(kw in user_lower for kw in [".py", "python", "backend"]):
+            return ["python-refactorer"]
+        if any(kw in user_lower for kw in [".tsx", ".jsx", "react", "frontend"]):
+            return ["nextjs-refactorer"]
+        return ["python-refactorer"]
+
+    def _load_skill_content(self, skill_name: str) -> Optional[str]:
+        """Load a skill file from .claude/skills/ directory.
+
+        Args:
+            skill_name: Name of the skill (without .md extension)
+
+        Returns:
+            Content of the skill file, or None if not found
+        """
+        # Load skills from REFACTA source (not target project)
+        skill_file = self.refacta_path / ".claude" / "skills" / f"{skill_name}.md"
+        if skill_file.exists():
+            return skill_file.read_text(encoding="utf-8")
+        return None
+
+    def _load_skills_for_agents(self, agent_names: List[str]) -> Dict[str, str]:
+        """Load unique skills needed by the selected agents.
+
+        Deduplicates skills - if multiple agents need the same skill,
+        it's loaded only once.
+
+        Args:
+            agent_names: List of selected agent names
+
+        Returns:
+            Dict mapping skill_name to skill_content
+        """
+        # Collect unique skill names from all selected agents
+        unique_skills = set()
+        for agent_name in agent_names:
+            agent_def = self._agents.get(agent_name)
+            if agent_def and agent_def.skills:
+                unique_skills.update(agent_def.skills)
+
+        # Load each unique skill once
+        skills = {}
+        for skill_name in unique_skills:
+            content = self._load_skill_content(skill_name)
+            if content:
+                skills[skill_name] = content
+
+        return skills
+
+    def _build_system_prompt_with_skills(
+        self,
+        agent_name: str,
+        skills: Dict[str, str],
+        concise_mode: bool = True,
+    ) -> str:
+        """Build a complete system prompt with agent definition and skills.
+
+        Args:
+            agent_name: The agent to use
+            skills: Dict of skill_name -> skill_content
+            concise_mode: If True, add token-saving instructions
+
+        Returns:
+            Complete system prompt string
+        """
+        agent_def = self._agents.get(agent_name)
+        if not agent_def:
+            return f"You are {agent_name}. Working directory: {self.project_path}"
+
+        # Start with agent prompt
+        prompt_parts = [agent_def.prompt]
+
+        # Add skills content (only first 500 chars per skill in concise mode)
+        if skills:
+            prompt_parts.append("\n\n# Skills and Guidelines\n")
+            for skill_name, skill_content in skills.items():
+                if concise_mode and len(skill_content) > 500:
+                    # Truncate long skills to save tokens
+                    skill_content = skill_content[:500] + "\n... (truncated for efficiency)"
+                prompt_parts.append(f"\n## {skill_name}\n\n{skill_content}")
+
+        # Add working directory
+        prompt_parts.append(f"\n\nWorking directory: {self.project_path}")
+
+        # Add token-saving instructions in concise mode
+        if concise_mode:
+            prompt_parts.append("""
+
+# IMPORTANT: Token Efficiency Rules
+- Complete the task in 1-2 turns maximum
+- Make edits directly without explaining what you'll do
+- Don't read files you don't need to edit
+- Skip verbose explanations - just do the work
+- If task is done, stop immediately""")
+
+        return "\n".join(prompt_parts)
+
+    async def run_with_smart_routing(
+        self,
+        prompt: str,
+        on_edit: Optional[Callable[[EditOperation], None]] = None,
+        on_text: Optional[Callable[[str], None]] = None,
+        *,
+        resume_session: bool = True,
+        track_report: bool = True,
+    ) -> AgentResponse:
+        """Run with 2-step smart routing for token efficiency.
+
+        Step 1: Route (~400 tokens) - Claude picks best agent(s) from descriptions
+        Step 2: Execute (~2-3k tokens) - Run with selected agent + skills only
+
+        Total: ~3k tokens vs ~10k for loading all agents (70% savings!)
+
+        Args:
+            prompt: User's request
+            on_edit: Callback for each edit (for live UI updates)
+            on_text: Callback for each text chunk (for streaming)
+            resume_session: Whether to resume from previous session
+            track_report: Whether to track edits in report file
+
+        Returns:
+            AgentResponse with results
+        """
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_cost = 0.0
+        all_edits: List[EditOperation] = []
+
+        try:
+            # STEP 1: Route to agents (~400 tokens)
+            selected_agents = await self._route_to_agents(prompt)
+
+            if not selected_agents:
+                return AgentResponse(
+                    content="Could not determine appropriate agent for this task.",
+                    agent_name="router",
+                    success=False,
+                    error="No agents selected",
+                )
+
+            # STEP 2: Skip skills loading - saves ~2k tokens per request!
+            # Agent prompts are sufficient for most tasks
+            skills = {}  # Empty - don't load skills to save tokens
+
+            # Initialize response variables BEFORE the loop
+            content_parts = []
+            response_session_id = None
+
+            # STEP 3: Execute with each selected agent sequentially
+            for agent_name in selected_agents:
+                agent_def = self._agents.get(agent_name)
+                if not agent_def:
+                    continue
+
+                # Tools needed for refactoring
+                # Read: to read file contents
+                # Edit: to make changes
+                # Glob: to find files in folders (needed for folder scope)
+                allowed_tools = ["Read", "Edit", "Glob"]
+
+                # Build system prompt with clear instructions
+                system_prompt = f"""You are {agent_name}. Working dir: {self.project_path}
+
+INSTRUCTIONS:
+1. If given a FOLDER path (like @folder/subfolder), use Glob to find ALL files:
+   - For Python: Glob pattern "folder/**/*.py"
+   - For TypeScript/React: Glob pattern "folder/**/*.tsx" or "folder/**/*.ts"
+2. Process EVERY file found - do NOT stop after one file!
+3. For EACH file in the list:
+   a. Read the file using Read tool
+   b. Apply changes using Edit tool
+4. Edit tool requires: file_path, old_string (exact text to replace), new_string (replacement text)
+
+CRITICAL: You MUST edit ALL files, not just the first one. Keep going until every file is processed.
+Do not stop early. Do not summarize. Complete ALL files."""
+
+                # Build options - NO session resume for smart routing (saves 10k+ tokens!)
+                # Each task starts fresh to minimize input tokens
+                options_dict = {
+                    "model": "claude-sonnet-4-5-20250929",  # Force Haiku for execution
+                    "max_turns": self.max_turns_smart,  # 10 turns to complete task
+                    "cwd": str(self.project_path),
+                    "allowed_tools": allowed_tools,
+                    "system_prompt": system_prompt,
+                }
+                # NOTE: Removed session resume - was causing 15k+ tokens per call!
+
+                options = ClaudeAgentOptions(**options_dict)
+
+                # Execute - per-iteration variables only
+                input_tokens = 0
+                output_tokens = 0
+                cost_usd = 0.0
+                got_result = False
+                shown_files = set()
+                streamed_text_ids = set()
+
+                try:
+                    async for message in query(prompt=prompt, options=options):
+                        msg_class = type(message).__name__
+
+                        # Handle AssistantMessage
+                        if isinstance(message, AssistantMessage):
+                            if hasattr(message, 'content'):
+                                for block in message.content:
+                                    # Stream text content LIVE
+                                    if hasattr(block, 'text'):
+                                        text = block.text
+                                        block_id = id(block)
+                                        if block_id not in streamed_text_ids:
+                                            streamed_text_ids.add(block_id)
+                                            content_parts.append(text)
+                                            if on_text and text.strip():
+                                                on_text(text)
+
+                                    # Capture Edit tool calls
+                                    if isinstance(block, ToolUseBlock):
+                                        if block.name == 'Edit':
+                                            tool_input = block.input
+                                            if isinstance(tool_input, dict):
+                                                file_path = tool_input.get('file_path', '')
+                                                if file_path and file_path not in shown_files:
+                                                    shown_files.add(file_path)
+                                                    edit_op = EditOperation(
+                                                        file_path=file_path,
+                                                        old_string=tool_input.get('old_string', ''),
+                                                        new_string=tool_input.get('new_string', ''),
+                                                    )
+                                                    all_edits.append(edit_op)
+
+                                                    # Track in report
+                                                    if track_report and self._report_tracker:
+                                                        self._report_tracker.on_edit(
+                                                            file_path=file_path,
+                                                            old_string=edit_op.old_string,
+                                                            new_string=edit_op.new_string,
+                                                            agent_name=agent_name,
+                                                            success=True,
+                                                        )
+
+                                                    # Live callback
+                                                    if on_edit:
+                                                        on_edit(edit_op)
+
+                        # Handle ResultMessage
+                        if msg_class == 'ResultMessage':
+                            got_result = True
+                            if hasattr(message, 'session_id'):
+                                response_session_id = message.session_id
+                            if hasattr(message, 'total_cost_usd'):
+                                cost_usd = message.total_cost_usd
+                            if hasattr(message, 'usage') and message.usage:
+                                usage = message.usage
+                                input_tokens = usage.get('input_tokens', 0)
+                                output_tokens = usage.get('output_tokens', 0)
+
+                except Exception as query_error:
+                    if not got_result and not content_parts:
+                        raise query_error
+
+                # Store session for this agent
+                if response_session_id:
+                    self._session_manager.set_agent_session(agent_name, response_session_id)
+
+                # Accumulate totals
+                total_input_tokens += input_tokens
+                total_output_tokens += output_tokens
+                total_cost += cost_usd
+
+            # Return combined results
+            tokens_used = total_input_tokens + total_output_tokens
+
+            return AgentResponse(
+                content="\n".join(content_parts) if content_parts else "",
+                agent_name=", ".join(selected_agents),
+                success=True,
+                tokens_used=tokens_used,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cost_usd=total_cost,
+                session_id=response_session_id,
+                edits=all_edits,
+            )
+
+        except Exception as e:
+            return AgentResponse(
+                content="",
+                agent_name="smart-router",
+                success=False,
+                error=str(e),
+            )
+
+    # =========================================================================
+    # END 2-STEP SMART ROUTING
+    # =========================================================================
 
     async def run_with_auto_selection(
         self,
@@ -1039,7 +1417,7 @@ async def run_agent(
     prompt: str,
     project_path: Path,
     *,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-sonnet-4-5-20250929",
     stream: bool = False,
     minimal_tools: bool = True,
 ) -> AgentResponse:
@@ -1065,7 +1443,7 @@ def run_agent_sync(
     prompt: str,
     project_path: Path,
     *,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-sonnet-4-5-20250929",
     stream: bool = False,
     minimal_tools: bool = True,
 ) -> AgentResponse:

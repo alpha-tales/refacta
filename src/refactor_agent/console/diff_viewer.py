@@ -10,24 +10,18 @@ Shows file changes like Claude Code with:
 from __future__ import annotations
 
 import difflib
-from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 from rich.text import Text
 from rich.panel import Panel
 from rich.syntax import Syntax
 from textual.widgets import Static
 
+# Import EditOperation from shared models to avoid circular imports
+from ..models import EditOperation
 
-@dataclass
-class EditOperation:
-    """Represents a single file edit operation."""
-
-    file_path: str
-    old_string: str
-    new_string: str
-    success: bool = True
-    error: Optional[str] = None
+# Re-export for backwards compatibility
+__all__ = ["EditOperation", "create_diff_text", "create_inline_diff", "DiffBubble", "DiffPanel", "format_edit_for_chat", "format_edit_full", "format_edits_summary"]
 
 
 def create_diff_text(old_string: str, new_string: str, context_lines: int = 3) -> Text:

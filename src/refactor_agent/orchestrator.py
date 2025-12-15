@@ -63,7 +63,7 @@ class RefactorOrchestrator:
 
     project_path: Path
     rules_path: Path
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-sonnet-4-5-20250929"
     dry_run: bool = False
     on_progress: Optional[Callable[[str, int, int], None]] = None
     on_message: Optional[Callable[[Any], None]] = None

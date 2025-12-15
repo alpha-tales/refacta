@@ -58,7 +58,7 @@ def default_command(
         help="Path to the project directory (default: current directory)",
     ),
     model: str = typer.Option(
-        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-5-20250929",
         "--model", "-m",
         help="Claude model to use",
     ),
@@ -135,7 +135,7 @@ def run(
         help="Plan and log changes without modifying files",
     ),
     model: str = typer.Option(
-        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-5-20250929",
         "--model", "-m",
         help="Claude model to use",
     ),

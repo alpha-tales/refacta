@@ -79,12 +79,24 @@ def get_file_candidates(
         return []
 
     candidates = []
-    ignored_dirs = {'node_modules', '__pycache__', 'venv', '.git', 'dist', 'build', '.refactor', '.claude'}
+    # Directories to ignore in autocomplete
+    ignored_dirs = {
+        'node_modules', '__pycache__', 'venv', 'myvenv', '.venv',
+        '.git', 'dist', 'build', '.refactor', '.claude',
+        'env', 'virtualenv', '.env', 'site-packages', '.next',
+        'coverage', '.nyc_output', '.cache', 'out'
+    }
+    # File extensions to ignore
+    ignored_extensions = {'.md', '.txt', '.log', '.pyc', '.pyo', '.map', '.lock'}
+
+    # Limits - collect more internally, display limit applied after sorting
+    collection_limit = 2000  # Collect up to 2000 items
+    display_limit = 300      # Show max 300 in autocomplete
 
     try:
         for root, dirs, filenames in os.walk(project_path):
             # Skip hidden and common ignored directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ignored_dirs]
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d.lower() not in ignored_dirs]
 
             rel_root = os.path.relpath(root, project_path)
 
@@ -96,27 +108,44 @@ def get_file_candidates(
                     else:
                         rel_path = os.path.join(rel_root, d)
                     candidates.append(FileCandidate(rel_path, is_folder=True))
-                    if len(candidates) >= 50:
-                        break
             else:
                 # Add files only (ScopeType.FILES)
                 for f in filenames:
                     if f.startswith('.'):
+                        continue
+                    # Skip ignored file extensions
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in ignored_extensions:
                         continue
                     if rel_root == '.':
                         rel_path = f
                     else:
                         rel_path = os.path.join(rel_root, f)
                     candidates.append(FileCandidate(rel_path, is_folder=False))
-                    if len(candidates) >= 100:
-                        break
 
-            if len(candidates) >= (50 if scope == ScopeType.FOLDER else 100):
+            # Only break at very high limit to ensure both frontend and backend are included
+            if len(candidates) >= collection_limit:
                 break
     except Exception:
         pass
 
-    return candidates
+    # Sort candidates: prioritize by depth (shallow first), then by name
+    priority_names = {'src', 'app', 'components', 'pages', 'lib', 'utils', 'hooks',
+                      'styles', 'api', 'services', 'models', 'types', 'interfaces',
+                      'frontend', 'backend', 'web', 'client', 'server'}
+
+    def sort_key(c):
+        path = c.rel_path
+        depth = path.count(os.sep) + path.count('/')  # Count path separators
+        name = os.path.basename(path).lower()
+        # Sort by: 1) depth (shallow first), 2) priority name, 3) alphabetical
+        is_priority = 0 if name in priority_names else 1
+        return (depth, is_priority, path.lower())
+
+    candidates.sort(key=sort_key)
+
+    # Apply final display limit
+    return candidates[:display_limit]
 
 
 class MessageBubble(Static):
@@ -749,6 +778,7 @@ class MainScreen(Screen):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._file_candidates: List[FileCandidate] = []
+        self._cached_scope: Optional[ScopeType] = None  # Track which scope was cached
 
     def compose(self) -> ComposeResult:
         # Back button at top left
@@ -806,10 +836,12 @@ class MainScreen(Screen):
         if " " in query:
             return []
 
-        # Load candidates based on scope (lazy load)
-        if not self._file_candidates:
+        # Load candidates based on scope (lazy load with scope tracking)
+        # Reload if scope changed or cache is empty
+        if not self._file_candidates or self._cached_scope != scope:
             project_path = getattr(self.app, "project_path", Path.cwd())
             self._file_candidates = get_file_candidates(project_path, scope)
+            self._cached_scope = scope
 
         # Filter candidates based on query and return DropdownItems
         if query:
@@ -822,6 +854,7 @@ class MainScreen(Screen):
     def on_mount(self) -> None:
         # Reset file candidates cache (in case scope changed)
         self._file_candidates = []
+        self._cached_scope = None
         self.query_one("#chat-input", Input).focus()
         self._update_input_hint()
         self._update_placeholder()
@@ -1062,10 +1095,12 @@ class MainScreen(Screen):
             asyncio.set_event_loop(loop)
             try:
                 if use_auto_selection:
-                    # NEW: Use SDK native agent auto-selection (FREE!)
-                    # Claude picks the best agent based on descriptions
+                    # 2-STEP SMART ROUTING (Token Efficient!)
+                    # Step 1: Route (~400 tokens) - Claude picks agents from descriptions
+                    # Step 2: Execute (~2-3k tokens) - Run with selected agent + skills
+                    # Total: ~3k tokens vs ~10k for loading all agents (70% savings!)
                     result = loop.run_until_complete(
-                        client.run_with_auto_selection(
+                        client.run_with_smart_routing(
                             prompt,
                             on_edit=on_edit,
                             on_text=on_text,
@@ -1150,13 +1185,15 @@ class MainScreen(Screen):
         return self.app._agent_client
 
     def _should_use_auto_selection(self, message: str) -> bool:
-        """Determine if we should use SDK native auto-selection.
+        """Determine if we should use 2-step smart routing.
 
-        Auto-selection is FREE (no extra API call) and uses agent descriptions
-        to automatically pick the best agent(s) for the task.
+        Smart routing is TOKEN EFFICIENT:
+        - Step 1: Route (~400 tokens) - Claude picks agents from descriptions
+        - Step 2: Execute (~2-3k tokens) - Run with selected agent + skills only
+        - Total: ~3k tokens vs ~10k for loading all agents (70% savings!)
 
         Returns:
-            True to use auto-selection (default), False to use manual selection
+            True to use smart routing (default), False to use manual selection
         """
         message_lower = message.lower()
 
@@ -1343,7 +1380,7 @@ class RefactorAgentApp(App):
     def __init__(
         self,
         project_path: Optional[Path] = None,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-sonnet-4-5-20250929",
         **kwargs
     ) -> None:
         super().__init__(**kwargs)
@@ -1363,7 +1400,7 @@ class RefactorAgentApp(App):
         self.push_screen("welcome")
 
 
-def run_app(project_path: Optional[Path] = None, model: str = "claude-haiku-4-5-20251001") -> None:
+def run_app(project_path: Optional[Path] = None, model: str = "claude-sonnet-4-5-20250929") -> None:
     """Run the Textual application."""
     app = RefactorAgentApp(project_path=project_path, model=model)
     app.run()

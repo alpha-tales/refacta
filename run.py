@@ -10,18 +10,19 @@ Usage:
 """
 
 import sys
-import os
-
-# Add src to path for development
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-
-# Load environment variables
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-env_path = Path(__file__).parent / ".env"
-if env_path.exists():
-    load_dotenv(env_path)
+# Add src to path for development imports
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_DIR = SCRIPT_DIR / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+# Load environment variables from .env file if it exists
+ENV_PATH = SCRIPT_DIR / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 
 from refactor_agent.cli import main
 

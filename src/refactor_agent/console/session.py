@@ -29,7 +29,7 @@ class RefactorSession:
     def __init__(
         self,
         project_path: Optional[Path] = None,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-sonnet-4-5-20250929",
     ) -> None:
         """Initialize the refactoring session.
 
@@ -273,7 +273,7 @@ IMPORTANT: Use @ paths in the user message as actual file paths relative to the 
 
 async def run_interactive_session(
     project_path: Optional[Path] = None,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-sonnet-4-5-20250929",
 ) -> None:
     """Run an interactive refactoring session (Rich-based).
 
@@ -290,7 +290,7 @@ async def run_interactive_session(
 
 def run_textual_app(
     project_path: Optional[Path] = None,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-sonnet-4-5-20250929",
 ) -> None:
     """Run the Textual-based TUI application.
 
