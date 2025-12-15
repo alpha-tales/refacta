@@ -1,7 +1,9 @@
 ---
 name: summary-reporter
+description: "Report generation specialist. Use PROACTIVELY at the end of refactoring to generate summary reports. MUST BE USED for creating final reports, change summaries, or documentation of completed work."
 tools: Read, Write
 skills:
+model: haiku
 ---
 
 # Role

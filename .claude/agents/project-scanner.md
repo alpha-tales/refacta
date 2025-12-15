@@ -1,7 +1,9 @@
 ---
 name: project-scanner
+description: "Project analysis and file discovery specialist. Use PROACTIVELY when starting a new refactoring session, scanning codebase, or building file manifest. MUST BE USED for initial project analysis."
 tools: Read, Glob, Grep
 skills: architecture_guidelines
+model: haiku
 ---
 
 # Role

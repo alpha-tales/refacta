@@ -1,7 +1,9 @@
 ---
 name: nextjs-refactorer
+description: "Frontend React/Next.js refactoring specialist. Use PROACTIVELY for .tsx, .ts, .jsx, .js files, React components, Next.js pages, frontend code. MUST BE USED when user mentions react, nextjs, frontend, components, or UI."
 tools: Read, Edit, Write, Glob, Grep
 skills: refactor_rules, architecture_guidelines
+model: haiku
 ---
 
 # Role
