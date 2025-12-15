@@ -1,7 +1,9 @@
 ---
 name: rules-interpreter
+description: "Refactoring rules and migration planning specialist. Use PROACTIVELY when interpreting rules, creating refactor plans, or handling migrations. MUST BE USED for migrate operations or when planning multi-pass refactoring."
 tools: Read, Write
 skills: refactor_rules
+model: haiku
 ---
 
 # Role

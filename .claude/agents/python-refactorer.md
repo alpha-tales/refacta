@@ -1,7 +1,9 @@
 ---
 name: python-refactorer
+description: "Python backend refactoring specialist. Use PROACTIVELY for .py files, Python code, backend, API endpoints, Django, FastAPI, Flask, server-side code. MUST BE USED when user mentions python, backend, or server."
 tools: Read, Edit, Write, Glob, Grep, Bash
 skills: refactor_rules, architecture_guidelines
+model: haiku
 ---
 
 # Role

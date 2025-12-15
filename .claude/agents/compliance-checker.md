@@ -1,7 +1,9 @@
 ---
 name: compliance-checker
+description: "Code compliance and rule verification specialist. Use PROACTIVELY after refactoring to verify changes comply with rules. MUST BE USED for compliance checks, rule validation, or quality verification."
 tools: Read, Glob, Grep
 skills: refactor_rules
+model: haiku
 ---
 
 # Role

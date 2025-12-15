@@ -1,7 +1,9 @@
 ---
 name: build-runner
-tools: Bash
+description: "Build and test execution specialist. Use PROACTIVELY after code changes to run builds, tests, and linters. MUST BE USED when user wants to build, test, lint, or verify code works."
+tools: Bash, Read
 skills:
+model: haiku
 ---
 
 # Role
