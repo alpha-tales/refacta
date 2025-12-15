@@ -41,6 +41,7 @@ venv.bak/
 .env
 .env.local
 .claude/settings.local.json
+myvenv/
 
 # Logs
 *.log

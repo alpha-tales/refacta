@@ -2,19 +2,168 @@
 
 This module provides proper integration with the Claude Agent SDK,
 including session management, setting sources, and cost tracking.
+
+Features:
+- Native SDK agent selection via description matching (FREE)
+- Automatic skill loading from agent frontmatter
+- Live report tracking on every edit
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import re
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ToolUseBlock
 
 from ..console.diff_viewer import EditOperation
+from .report_tracker import ReportTracker, get_tracker
+
+
+@dataclass
+class AgentDefinition:
+    """Parsed agent definition from .md file."""
+
+    name: str
+    description: str
+    prompt: str
+    tools: List[str]
+    skills: List[str]
+    model: str = "haiku"
+
+
+def parse_agent_frontmatter(content: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from agent markdown file.
+
+    Args:
+        content: Full content of the .md file
+
+    Returns:
+        Tuple of (frontmatter_dict, body_content)
+    """
+    # Match YAML frontmatter between --- markers
+    pattern = r'^---\s*\n(.*?)\n---\s*\n(.*)$'
+    match = re.match(pattern, content, re.DOTALL)
+
+    if not match:
+        return {}, content
+
+    frontmatter_str = match.group(1)
+    body = match.group(2)
+
+    try:
+        frontmatter = yaml.safe_load(frontmatter_str) or {}
+    except yaml.YAMLError:
+        frontmatter = {}
+
+    return frontmatter, body
+
+
+def load_agent_definition(agent_file: Path) -> Optional[AgentDefinition]:
+    """Load and parse a single agent definition from .md file.
+
+    Args:
+        agent_file: Path to the agent .md file
+
+    Returns:
+        AgentDefinition or None if parsing fails
+    """
+    if not agent_file.exists():
+        return None
+
+    content = agent_file.read_text(encoding="utf-8")
+    frontmatter, body = parse_agent_frontmatter(content)
+
+    name = frontmatter.get("name", agent_file.stem)
+    description = frontmatter.get("description", "")
+
+    # Parse tools (comma-separated string or list)
+    tools_raw = frontmatter.get("tools", "")
+    if isinstance(tools_raw, str):
+        tools = [t.strip() for t in tools_raw.split(",") if t.strip()]
+    else:
+        tools = list(tools_raw) if tools_raw else []
+
+    # Parse skills (comma-separated string or list)
+    skills_raw = frontmatter.get("skills", "")
+    if isinstance(skills_raw, str):
+        skills = [s.strip() for s in skills_raw.split(",") if s.strip()]
+    else:
+        skills = list(skills_raw) if skills_raw else []
+
+    model = frontmatter.get("model", "haiku")
+
+    return AgentDefinition(
+        name=name,
+        description=description,
+        prompt=body.strip(),
+        tools=tools,
+        skills=skills,
+        model=model,
+    )
+
+
+def load_all_agents(project_path: Path) -> Dict[str, AgentDefinition]:
+    """Load all agent definitions from .claude/agents/ directory.
+
+    Args:
+        project_path: Root project path
+
+    Returns:
+        Dict mapping agent name to AgentDefinition
+    """
+    agents_dir = project_path / ".claude" / "agents"
+    agents = {}
+
+    if not agents_dir.exists():
+        return agents
+
+    for agent_file in agents_dir.glob("*.md"):
+        agent_def = load_agent_definition(agent_file)
+        if agent_def:
+            agents[agent_def.name] = agent_def
+
+    return agents
+
+
+def build_agents_for_sdk(agents: Dict[str, AgentDefinition]) -> Dict[str, dict]:
+    """Convert AgentDefinitions to SDK-compatible agents dict.
+
+    This is the format expected by the `agents` parameter in ClaudeAgentOptions.
+
+    Args:
+        agents: Dict of AgentDefinition objects
+
+    Returns:
+        Dict suitable for SDK's agents parameter
+    """
+    sdk_agents = {}
+
+    for name, agent_def in agents.items():
+        sdk_agents[name] = {
+            "description": agent_def.description,
+            "prompt": agent_def.prompt,
+        }
+
+        # Only include tools if specified (otherwise inherits all)
+        if agent_def.tools:
+            sdk_agents[name]["tools"] = agent_def.tools
+
+        # Map model names to SDK format
+        model_map = {
+            "haiku": "haiku",
+            "sonnet": "sonnet",
+            "opus": "opus",
+        }
+        if agent_def.model in model_map:
+            sdk_agents[name]["model"] = model_map[agent_def.model]
+
+    return sdk_agents
 
 
 @dataclass
@@ -145,10 +294,11 @@ class AgentClient:
 
     Features:
     - Uses official query() function from claude_agent_sdk
-    - Configures setting_sources to load skills and CLAUDE.md
+    - Native SDK agent selection via description matching (FREE - no extra API call)
+    - Automatic skill loading from agent frontmatter
+    - Live report tracking on every edit
     - Session management for context preservation across pipeline stages
     - Proper cost tracking by message ID (no double counting)
-    - Limited to 3 max_turns to reduce API costs (each turn = 1 API call)
     """
 
     project_path: Path
@@ -158,13 +308,35 @@ class AgentClient:
     _session_manager: SessionManager = field(default_factory=SessionManager)
     _cost_tracker: CostTracker = field(default_factory=CostTracker)
     _on_message: Optional[Callable[[Any], None]] = None
+    _agents: Dict[str, AgentDefinition] = field(default_factory=dict)
+    _report_tracker: Optional[ReportTracker] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        """Validate environment."""
+        """Validate environment and load agents."""
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable not set")
         self.project_path = Path(self.project_path).resolve()
+
+        # Load all agents from .claude/agents/
+        self._agents = load_all_agents(self.project_path)
+
+        # Initialize report tracker
+        self._report_tracker = get_tracker(self.project_path)
+
+    def get_available_agents(self) -> List[str]:
+        """Get list of available agent names."""
+        return list(self._agents.keys())
+
+    def get_agent_info(self, agent_name: str) -> Optional[AgentDefinition]:
+        """Get agent definition by name."""
+        return self._agents.get(agent_name)
+
+    def get_report_tracker(self) -> ReportTracker:
+        """Get the report tracker instance."""
+        if self._report_tracker is None:
+            self._report_tracker = get_tracker(self.project_path)
+        return self._report_tracker
 
     def set_message_callback(self, callback: Callable[[Any], None]) -> None:
         """Set callback for real-time message handling."""
@@ -311,6 +483,170 @@ IMPORTANT: Always USE tools to complete tasks. Do not just describe what you wou
 3. Confirm what you changed
 
 Be direct and concise. Execute actions, don't just plan them."""
+
+    def _build_options_with_auto_selection(
+        self,
+        resume_session: Optional[str] = None,
+    ) -> ClaudeAgentOptions:
+        """Build SDK options with native agent auto-selection.
+
+        This passes ALL agents to the SDK via the `agents` parameter.
+        Claude automatically selects the best agent based on description matching.
+        This is FREE - no extra API call needed for agent selection!
+
+        Args:
+            resume_session: Session ID to resume
+
+        Returns:
+            ClaudeAgentOptions with agents parameter for auto-selection
+        """
+        # Convert our agents to SDK format
+        sdk_agents = build_agents_for_sdk(self._agents)
+
+        options_dict = {
+            "model": self.model,
+            "max_turns": self.max_turns_full,
+            "cwd": str(self.project_path),
+            "setting_sources": ["project"],  # Load skills and CLAUDE.md
+            "agents": sdk_agents,  # Native SDK agent selection!
+        }
+
+        # Session management
+        if resume_session:
+            options_dict["resume"] = resume_session
+
+        return ClaudeAgentOptions(**options_dict)
+
+    async def run_with_auto_selection(
+        self,
+        prompt: str,
+        on_edit: Optional[Callable[[EditOperation], None]] = None,
+        on_text: Optional[Callable[[str], None]] = None,
+        *,
+        resume_session: bool = True,
+        track_report: bool = True,
+    ) -> AgentResponse:
+        """Run with SDK native agent auto-selection.
+
+        Claude automatically picks the best agent(s) based on the prompt
+        and agent descriptions. This is FREE - no extra API call needed!
+
+        Args:
+            prompt: User's request
+            on_edit: Callback for each edit (for live UI updates)
+            on_text: Callback for each text chunk (for streaming)
+            resume_session: Whether to resume from previous session
+            track_report: Whether to track edits in report file
+
+        Returns:
+            AgentResponse with results
+        """
+        try:
+            session_id = None
+            if resume_session:
+                session_id = self._session_manager.get_main_session()
+
+            options = self._build_options_with_auto_selection(session_id)
+
+            content_parts = []
+            response_session_id = None
+            input_tokens = 0
+            output_tokens = 0
+            cost_usd = 0.0
+            got_result = False
+            edits: List[EditOperation] = []
+            shown_files = set()
+            streamed_text_ids = set()
+            current_agent = "auto"
+
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    msg_class = type(message).__name__
+
+                    # Handle AssistantMessage - contains both text and tool calls
+                    if isinstance(message, AssistantMessage):
+                        if hasattr(message, 'content'):
+                            for block in message.content:
+                                # Stream text content LIVE
+                                if hasattr(block, 'text'):
+                                    text = block.text
+                                    block_id = id(block)
+                                    if block_id not in streamed_text_ids:
+                                        streamed_text_ids.add(block_id)
+                                        content_parts.append(text)
+                                        if on_text and text.strip():
+                                            on_text(text)
+
+                                # Capture Edit tool calls
+                                if isinstance(block, ToolUseBlock):
+                                    if block.name == 'Edit':
+                                        tool_input = block.input
+                                        if isinstance(tool_input, dict):
+                                            file_path = tool_input.get('file_path', '')
+                                            if file_path and file_path not in shown_files:
+                                                shown_files.add(file_path)
+                                                edit_op = EditOperation(
+                                                    file_path=file_path,
+                                                    old_string=tool_input.get('old_string', ''),
+                                                    new_string=tool_input.get('new_string', ''),
+                                                )
+                                                edits.append(edit_op)
+
+                                                # Track in report
+                                                if track_report and self._report_tracker:
+                                                    self._report_tracker.on_edit(
+                                                        file_path=file_path,
+                                                        old_string=edit_op.old_string,
+                                                        new_string=edit_op.new_string,
+                                                        agent_name=current_agent,
+                                                        success=True,
+                                                    )
+
+                                                # Live callback
+                                                if on_edit:
+                                                    on_edit(edit_op)
+
+                    # Handle ResultMessage
+                    if msg_class == 'ResultMessage':
+                        got_result = True
+                        if hasattr(message, 'session_id'):
+                            response_session_id = message.session_id
+                        if hasattr(message, 'total_cost_usd'):
+                            cost_usd = message.total_cost_usd
+                        if hasattr(message, 'usage') and message.usage:
+                            usage = message.usage
+                            input_tokens = usage.get('input_tokens', 0)
+                            output_tokens = usage.get('output_tokens', 0)
+
+            except Exception as query_error:
+                if not got_result and not content_parts:
+                    raise query_error
+
+            if response_session_id:
+                self._session_manager.set_main_session(response_session_id)
+
+            content = "\n".join(content_parts) if content_parts else ""
+            tokens_used = input_tokens + output_tokens
+
+            return AgentResponse(
+                content=content,
+                agent_name=current_agent,
+                success=True,
+                tokens_used=tokens_used,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost_usd,
+                session_id=response_session_id,
+                edits=edits,
+            )
+
+        except Exception as e:
+            return AgentResponse(
+                content="",
+                agent_name="auto",
+                success=False,
+                error=str(e),
+            )
 
     async def run_agent(
         self,

@@ -1051,27 +1051,42 @@ class MainScreen(Screen):
                 self.app.call_from_thread(self._add_assistant_message, response)
                 return
 
-            # Determine which agent and mode to use
-            agent_name = self._select_agent(message)
-            use_full_preset, minimal_tools = self._select_mode(message)
+            # Determine mode: auto-selection (default) or manual
+            use_auto_selection = self._should_use_auto_selection(message)
 
-            # Build prompt with context (pass mode for proper instructions)
-            prompt = self._build_prompt(message, use_full_preset=use_full_preset)
+            # Build prompt with context
+            prompt = self._build_prompt(message, use_full_preset=True)
 
             # Run with LIVE UPDATES - both text and edits stream in order
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                result = loop.run_until_complete(
-                    client.run_agent_with_live_updates(
-                        agent_name, prompt,
-                        on_edit=on_edit,
-                        on_text=on_text,  # NEW: Stream text too!
-                        resume_session=True,
-                        use_full_preset=use_full_preset,
-                        minimal_tools=minimal_tools,
+                if use_auto_selection:
+                    # NEW: Use SDK native agent auto-selection (FREE!)
+                    # Claude picks the best agent based on descriptions
+                    result = loop.run_until_complete(
+                        client.run_with_auto_selection(
+                            prompt,
+                            on_edit=on_edit,
+                            on_text=on_text,
+                            resume_session=True,
+                            track_report=True,  # Track edits in .refactor/reports/changes.md
+                        )
                     )
-                )
+                else:
+                    # Fallback: Manual agent selection (old method)
+                    agent_name = self._select_agent(message)
+                    use_full_preset, minimal_tools = self._select_mode(message)
+                    result = loop.run_until_complete(
+                        client.run_agent_with_live_updates(
+                            agent_name, prompt,
+                            on_edit=on_edit,
+                            on_text=on_text,
+                            resume_session=True,
+                            use_full_preset=use_full_preset,
+                            minimal_tools=minimal_tools,
+                        )
+                    )
             finally:
                 loop.close()
 
@@ -1086,12 +1101,23 @@ class MainScreen(Screen):
 
                 self.app.call_from_thread(self._remove_loading)
 
+                # Finalize the report tracker and get report path
+                report_path = None
+                if result.edits and client:
+                    tracker = client.get_report_tracker()
+                    report_path = tracker.finalize(
+                        total_tokens=result.tokens_used,
+                        cost_usd=result.cost_usd,
+                    )
+
                 # Show final summary
                 if result.edits:
-                    # Had edits - show completion message
+                    # Had edits - show completion message with report link
                     token_info = f"Done! Edited {len(result.edits)} file(s)."
                     if result.tokens_used > 0:
                         token_info += f" [Tokens: {result.tokens_used:,}]"
+                    if report_path:
+                        token_info += f"\n\nReport saved: .refactor/reports/changes.md"
                     self.app.call_from_thread(self._add_assistant_message, token_info)
                 elif not had_text:
                     # No edits and no streaming text seen - show full response
@@ -1122,6 +1148,29 @@ class MainScreen(Screen):
             except Exception:
                 return None
         return self.app._agent_client
+
+    def _should_use_auto_selection(self, message: str) -> bool:
+        """Determine if we should use SDK native auto-selection.
+
+        Auto-selection is FREE (no extra API call) and uses agent descriptions
+        to automatically pick the best agent(s) for the task.
+
+        Returns:
+            True to use auto-selection (default), False to use manual selection
+        """
+        message_lower = message.lower()
+
+        # Force manual selection if user explicitly specifies an agent
+        manual_triggers = [
+            "use python-refactorer", "use nextjs-refactorer",
+            "use project-scanner", "use build-runner",
+            "manual mode", "specific agent"
+        ]
+        if any(trigger in message_lower for trigger in manual_triggers):
+            return False
+
+        # Default: Use auto-selection (FREE and smart!)
+        return True
 
     def _select_mode(self, message: str) -> tuple[bool, bool]:
         """Dynamically select mode based on user message to optimize cost.
